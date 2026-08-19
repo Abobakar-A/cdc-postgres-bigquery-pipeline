@@ -1,0 +1,60 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+
+  zookeeper:
+    image: quay.io/debezium/zookeeper:2.5
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: quay.io/debezium/kafka:2.5
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    links:
+      - zookeeper
+    environment:
+      - ZOOKEEPER_CONNECT=zookeeper:2181
+
+  connect:
+    build:
+      context: .
+      dockerfile: Dockerfile.connect
+    container_name: connect
+    ports:
+      - "8083:8083"
+    links:
+      - kafka
+      - zookeeper
+      - postgres
+    environment:
+      - CONNECT_BOOTSTRAP_SERVERS=kafka:9092
+      - CONNECT_REST_PORT=8083
+      - CONNECT_GROUP_ID=1
+      - CONNECT_CONFIG_STORAGE_TOPIC=my_connect_configs
+      - CONNECT_OFFSET_STORAGE_TOPIC=my_connect_offsets
+      - CONNECT_STATUS_STORAGE_TOPIC=my_connect_statuses
+      - CONNECT_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_REST_ADVERTISED_HOST_NAME=connect
+      - CONNECT_PLUGIN_PATH=/usr/share/java,/usr/share/confluent-hub-components
+      - CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR=1
+      - CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR=1
+      - CONNECT_STATUS_STORAGE_REPLICATION_FACTOR=1
+    volumes:
+      - ./secrets:/secrets
