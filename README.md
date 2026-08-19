@@ -82,7 +82,7 @@ This is a **Google Cloud billing policy restriction**, not a pipeline design or 
 6. **Secrets handling**: connector configs currently have the Postgres password inlined directly in committed JSON for local development speed; production/portfolio-complete version should externalize this via Kafka Connect's `FileConfigProvider` or environment-variable substitution at deploy time.
 7. **Persistent volumes**: Postgres and Kafka currently run without persistent Docker volumes, so data is lost on `docker compose down`. Adding named volumes would allow the environment to be stopped/restarted without re-seeding source data.
 
-## Key Lessons (for interview discussion)
+## Key Lessons 
 
 - CDC's core idea — read the database's change log instead of polling/batch-querying — is universal across databases, but each database has its own knob that determines how much detail is captured on UPDATE/DELETE (Postgres: `REPLICA IDENTITY`; MySQL: `binlog_format=ROW`; SQL Server: native CDC capture instances).
 - A CDC pipeline's raw/landing layer must be explicitly scoped away from its own destination if the destination lives in the same source system, to avoid feedback loops.
