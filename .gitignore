@@ -5,3 +5,4 @@ secrets/
 gatekeeper_env/dbt_project/logs/
 dbt_project/target/
 dbt_project/.user.yml
+**/__pycache__/
