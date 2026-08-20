@@ -1,0 +1,11 @@
+name: 'invoices_pipeline'
+version: '1.0.0'
+config-version: 2
+
+profile: 'invoices_pipeline'
+
+model-paths: ["models"]
+
+models:
+  invoices_pipeline:
+    +materialized: table

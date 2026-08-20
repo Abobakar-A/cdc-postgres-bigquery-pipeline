@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: dim_invoices_current
+    description: "One row per invoice, showing its latest known status."
+    columns:
+      - name: invoice_id
+        description: "Unique identifier for each invoice."
+        tests:
+          - not_null
+          - unique
+      - name: customer_name
+        description: "Customer name on the invoice."
+        tests:
+          - not_null
+      - name: status
+        description: "Current status of the invoice."
+        tests:
+          - not_null

@@ -1,0 +1,11 @@
+invoices_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: clickhouse
+      schema: cdc_raw
+      host: "{{ env_var('CLICKHOUSE_HOST') }}"
+      port: 8123
+      user: "{{ env_var('CLICKHOUSE_USER') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD') }}"
+      secure: false
