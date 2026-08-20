@@ -1,12 +1,12 @@
-# CDC Pipeline: Postgres → Debezium → Kafka → BigQuery
+# CDC Pipeline: Postgres → Debezium → Kafka → ClickHouse (with a BigQuery attempt documented)
 
 ## Objective
 
-Build a hands-on, real (non-simulated) Change Data Capture (CDC) pipeline to understand how source-system changes can be captured and streamed into a cloud data warehouse in near real-time — without using a managed framework like Spark.
+Build a hands-on, real (non-simulated) Change Data Capture (CDC) pipeline to understand how source-system changes can be captured and streamed into a data warehouse in near real-time — without using a managed framework like Spark.
 
-This project was built as preparation for a Data Engineering role requiring hands-on experience with CDC, Snowflake-style cloud warehousing, and high-volume transactional data pipelines (e-Invoicing use case). BigQuery was used in place of Snowflake due to trial/account availability, but the pipeline architecture and concepts transfer directly.
+This project was built as preparation for a Data Engineering role requiring hands-on experience with CDC, Snowflake-style cloud warehousing, and high-volume transactional data pipelines (e-Invoicing use case). The pipeline was first built against BigQuery, then re-pointed to a self-hosted ClickHouse instance after hitting a cloud billing restriction — both attempts are documented below, since the debugging process itself demonstrates real CDC/pipeline understanding.
 
-## Architecture
+## Final Architecture (working end-to-end)
 
 ```
 Postgres (source DB)
@@ -18,27 +18,29 @@ Debezium (Postgres source connector, runs inside Kafka Connect)
 Kafka (topic: cdc.public.invoices)
    │  durable, ordered event stream
    ▼
-BigQuery Sink Connector (Kafka Connect)
-   │  writes each change event as a row
+ClickHouse Kafka Table Engine (native consumer, no separate connector)
+   │  materialized view continuously copies new messages
    ▼
-BigQuery (dataset: cdc_raw, table: cdc_public_invoices)
+ClickHouse MergeTree table (cdc_invoices_raw) — queryable via SQL / Web UI
 ```
 
-All services run locally in a GitHub Codespace via Docker Compose.
+All services run locally in a GitHub Codespace via Docker Compose — no cloud account or billing required for the final working version.
 
 ## What Was Built
 
 1. **Source database**: Postgres 15, with `wal_level=logical` enabled and an `invoices` table (invoice_id, customer_name, amount, status, updated_at).
 
-2. **CDC capture**: Debezium Postgres connector registered via Kafka Connect's REST API, using `pgoutput` logical decoding and a dedicated replication slot (`invoices_slot`), scoped to only the `invoices` table via `table.include.list` (to avoid a self-referential replication loop, discovered and fixed during a manual prototype phase — see "Key Lessons" below).
+2. **CDC capture**: Debezium Postgres connector registered via Kafka Connect's REST API, using `pgoutput` logical decoding and a dedicated replication slot (`invoices_slot`), scoped to only the `invoices` table via `table.include.list`.
 
 3. **Streaming transport**: Kafka + Zookeeper, single-broker local cluster. Kafka Connect configured with replication factor 1 for internal topics (config/offset/status storage), required for single-broker setups.
 
-4. **Sink**: WePay/Confluent's `kafka-connect-bigquery` connector, installed into a custom Kafka Connect image (built on `confluentinc/cp-kafka-connect`) via `confluent-hub`. Configured with `autoCreateTables=true`, so the target BigQuery table schema is derived automatically from the incoming Debezium event schema (before/after/source/op/ts_ms/transaction).
+4. **Manual CDC prototype (preliminary phase)**: Before building the full Kafka/Debezium stack, CDC internals were explored directly using Postgres's native logical replication API (`pg_create_logical_replication_slot`, `pg_logical_slot_get_changes`) via a small Python polling script. This surfaced two important production-relevant behaviors firsthand:
+   - **DELETE events lose row data by default** (`REPLICA IDENTITY DEFAULT`) unless the table has `REPLICA IDENTITY FULL` — critical for pipelines needing full old-row visibility (e.g. invoice deletion audit trails).
+   - **A landing table sitting inside the same replication scope as the source data causes a feedback loop** (each captured write becomes a new captured event). Solved by explicitly scoping the connector to only the intended source table(s).
 
-5. **Manual CDC prototype (preliminary phase)**: Before building the full Kafka/Debezium stack, CDC internals were explored directly using Postgres's native logical replication API (`pg_create_logical_replication_slot`, `pg_logical_slot_get_changes`) via a small Python polling script. This surfaced two important production-relevant behaviors firsthand:
-   - **DELETE events lose row data by default** (`REPLICA IDENTITY DEFAULT`) unless the table has `REPLICA IDENTITY FULL`, which is critical for any pipeline needing full old-row visibility (e.g. invoice deletion audit trails).
-   - **A landing table sitting inside the same replication scope as the source data can cause a feedback loop** (each captured write becomes a new captured event). Solved by explicitly scoping the connector to only the intended source table(s).
+5. **Sink — attempt 1 (BigQuery)**: WePay/Confluent's `kafka-connect-bigquery` connector was installed into a custom Kafka Connect image (built on `confluentinc/cp-kafka-connect`) via `confluent-hub`. It successfully registered, ran, and auto-created the target BigQuery table schema from the Debezium event structure — but writes failed with `Access Denied: Streaming insert is not allowed in the free tier`, a GCP billing policy restriction (not a pipeline defect). See "BigQuery Attempt" section below for full detail.
+
+6. **Sink — attempt 2 / final working solution (ClickHouse)**: Self-hosted ClickHouse (Docker), using its native `Kafka` table engine to consume directly from the `cdc.public.invoices` topic — no Kafka Connect plugin required. A `MergeTree` table plus a `MATERIALIZED VIEW` continuously persist incoming events. Verified end-to-end: inserting a row into Postgres reliably appears in ClickHouse within seconds, queryable both via `clickhouse-client` and ClickHouse's built-in Web SQL UI (port 8123).
 
 ## Full Stack
 
@@ -48,43 +50,44 @@ All services run locally in a GitHub Codespace via Docker Compose.
 | Change capture | Debezium 2.5 (PostgreSQL connector, pgoutput plugin) |
 | Streaming | Apache Kafka + Zookeeper (Debezium images) |
 | Connector runtime | Kafka Connect (Confluent `cp-kafka-connect:7.6.1` base image, custom-built) |
-| Sink connector | WePay/Confluent `kafka-connect-bigquery` |
-| Destination warehouse | Google BigQuery (dataset `cdc_raw`) |
+| Sink (attempted) | WePay/Confluent `kafka-connect-bigquery` → Google BigQuery |
+| Sink (working) | ClickHouse (native Kafka table engine + materialized view) |
 | Orchestration of infra | Docker Compose |
 | Environment | GitHub Codespaces |
 | Planned but not yet implemented | dbt (raw → staging merge/upsert, schema contracts) + Airflow (orchestration, reconciliation) |
 
 ## Result
 
-The pipeline was verified working end-to-end at the mechanical level:
-- Inserting a row into Postgres `invoices` was correctly captured by Debezium and published as a structured JSON change event to the Kafka topic `cdc.public.invoices`, including full before/after row images, operation type (`op: c/u/d`), transaction ID, and LSN.
-- The BigQuery sink connector successfully registered, ran, and auto-created the target table `cdc_raw.cdc_public_invoices` with a schema matching the Debezium event envelope.
-- The connector correctly attempted to write each captured event to BigQuery in real time.
+The pipeline is verified working end-to-end, with real data provably traveling through every layer:
+- Inserting a row into Postgres `invoices` is captured by Debezium and published as a structured JSON change event to Kafka, including full before/after row images, operation type (`op: c/u/d`), transaction ID, and LSN.
+- ClickHouse's Kafka table engine consumes the topic in real time; a materialized view persists each event into a permanent `MergeTree` table.
+- Confirmed via direct query (both CLI and Web UI) that inserted rows appear in ClickHouse within seconds of the source Postgres insert, with the full Debezium event payload intact.
 
-## Limitation Hit
+## BigQuery Attempt (documented, not abandoned lightly)
 
 Writes to BigQuery failed with:
 ```
 Access Denied: BigQuery: Streaming insert is not allowed in the free tier
 ```
 
-This is a **Google Cloud billing policy restriction**, not a pipeline design or configuration issue: the default BigQuery sink connector write path uses the streaming insert API, which requires a billing-enabled GCP project (a Sandbox/free-tier project without a linked payment method is blocked from streaming inserts, and blocked from provisioning most other paid-tier resources such as GCS buckets needed for the batch-load alternative).
+This is a **Google Cloud billing policy restriction**, not a pipeline design or configuration issue: the default BigQuery sink connector write path uses the streaming insert API, which requires a billing-enabled GCP project. A Sandbox/free-tier project without a linked payment method is blocked from streaming inserts, and also blocked from provisioning the GCS bucket needed for the batch-load alternative (`enableBatchLoad`) — so the workaround path was blocked by the same root constraint.
 
-**Diagnosis confirmed via connector logs** (`docker logs connect`), which surfaced the exact underlying `403 Forbidden` / `accessDenied` response from the BigQuery API — validating that every upstream layer (Postgres, Debezium, Kafka, Kafka Connect, the sink connector's write logic) was functioning correctly up to the final API call.
+**Diagnosis confirmed via connector logs** (`docker logs connect`), which surfaced the exact underlying `403 Forbidden` / `accessDenied` response from the BigQuery API — validating that every upstream layer (Postgres, Debezium, Kafka, Kafka Connect, the sink connector's write logic) was functioning correctly right up to the final API call. Given no available billing method, the sink was switched to a self-hosted ClickHouse instance, which achieves the same architectural goal (CDC events landing in a queryable analytical store) with zero cloud dependency.
 
 ## Room for Improvement / Next Steps
 
-1. **Resolve the write path**: either enable GCP billing (streaming inserts work immediately, GCP's free credit tier covers typical usage), or reconfigure the sink connector with `enableBatchLoad=true` + a GCS staging bucket, which avoids the streaming API and is free-tier compatible (though less real-time — writes land in batches on an interval rather than immediately).
-2. **Swap BigQuery for Snowflake**: since the target role specifically requires Snowflake, re-pointing the sink to a Snowflake sink connector (Kafka Connector for Snowflake, officially maintained) would make this project directly match the job's tech stack.
-3. **Add the merge/transform layer (dbt)**: currently, raw change events land as an append-only log (every INSERT/UPDATE/DELETE is a new row). The next step is a dbt model that performs a `MERGE`/upsert from this raw event log into a clean "current state" table per invoice, handling out-of-order and duplicate (at-least-once delivery) events idempotently.
-4. **Add orchestration and reconciliation (Airflow)**: schedule the dbt merge runs, and add a reconciliation DAG comparing row counts / sums between Postgres source and the BigQuery current-state table to catch any pipeline gaps — directly relevant to the "data reconciliation" and "exception handling" requirements of the target role.
-5. **Schema mismatch protection**: land raw data as loosely-typed/JSON to tolerate source schema drift, and enforce a stricter schema (dbt model contracts) at the staging layer so drift fails loudly there instead of silently corrupting downstream tables.
-6. **Secrets handling**: connector configs currently have the Postgres password inlined directly in committed JSON for local development speed; production/portfolio-complete version should externalize this via Kafka Connect's `FileConfigProvider` or environment-variable substitution at deploy time.
-7. **Persistent volumes**: Postgres and Kafka currently run without persistent Docker volumes, so data is lost on `docker compose down`. Adding named volumes would allow the environment to be stopped/restarted without re-seeding source data.
+1. **Swap ClickHouse for Snowflake in a real environment**: since the target role specifically requires Snowflake, the same Debezium/Kafka pipeline could be pointed at Snowflake's officially maintained Kafka Connector when billing/trial access is available — the capture and transport layers would not need to change.
+2. **Add the merge/transform layer (dbt)**: currently, raw change events land as an append-only log (every INSERT/UPDATE/DELETE is a new row). The next step is a model that performs a `MERGE`/upsert from this raw event log into a clean "current state" table per invoice, handling out-of-order and duplicate (at-least-once delivery) events idempotently.
+3. **Add orchestration and reconciliation (Airflow)**: schedule merge runs, and add a reconciliation DAG comparing row counts / sums between Postgres source and the destination current-state table to catch any pipeline gaps — directly relevant to the "data reconciliation" and "exception handling" requirements of the target role.
+4. **Schema mismatch protection**: land raw data as loosely-typed/JSON (already the case here) to tolerate source schema drift, and enforce a stricter schema at the staging/transform layer so drift fails loudly there instead of silently corrupting downstream tables. Next experiment: alter the Postgres `invoices` table live (add/rename/change a column type) and observe exactly how the Debezium event schema and downstream consumers respond.
+5. **Secrets handling**: connector/service configs currently reference values via `.env` (git-ignored) rather than hardcoded — the Postgres and ClickHouse passwords follow this pattern; the next step for full production-readiness would be externalizing secrets via Kafka Connect's `FileConfigProvider` or a secrets manager rather than plain environment variables.
+6. **Persistent volumes**: Postgres, Kafka, and ClickHouse currently run without persistent Docker volumes, so data is lost on `docker compose down` (observed directly during this project — source table and connector registrations had to be recreated multiple times). Adding named volumes would allow the environment to be stopped/restarted without re-seeding source data.
 
 ## Key Lessons 
 
 - CDC's core idea — read the database's change log instead of polling/batch-querying — is universal across databases, but each database has its own knob that determines how much detail is captured on UPDATE/DELETE (Postgres: `REPLICA IDENTITY`; MySQL: `binlog_format=ROW`; SQL Server: native CDC capture instances).
 - A CDC pipeline's raw/landing layer must be explicitly scoped away from its own destination if the destination lives in the same source system, to avoid feedback loops.
 - Kafka Connect's internal topics (config/offset/status storage) require enough brokers to satisfy their replication factor — single-broker local setups need this explicitly set to 1.
-- Cloud provider free/sandbox tiers frequently restrict specific write paths (like BigQuery streaming inserts) even when the rest of the service is otherwise usable — a real operational constraint worth designing around (e.g., preferring batch load, or documenting billing prerequisites) rather than a pipeline bug.
+- Cloud provider free/sandbox tiers frequently restrict specific write paths (like BigQuery streaming inserts) even when the rest of the service is otherwise usable — a real operational constraint worth designing around, not a pipeline bug.
+- Not every sink requires Kafka Connect: some destinations (like ClickHouse) can consume directly from Kafka via a native table engine, which can be simpler to operate for certain architectures and is a legitimate alternative to the Kafka Connect sink-connector pattern.
+- Docker containers with no persistent volumes lose all state on `down`/recreate — when only some containers in a multi-service stack restart (rather than all together), previously-registered identities (like a Kafka broker ID held in Zookeeper) can conflict with freshly-started ones. Restarting a stack's stateful services together (or using `stop`/`start` instead of `down`/`up` when no config has changed) avoids this class of error.
