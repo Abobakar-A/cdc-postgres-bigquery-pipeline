@@ -73,3 +73,13 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+
+  gatekeeper:
+    build:
+      context: .
+      dockerfile: Dockerfile.gatekeeper
+    container_name: gatekeeper
+    depends_on:
+      - kafka
+      - clickhouse
+    restart: unless-stopped
