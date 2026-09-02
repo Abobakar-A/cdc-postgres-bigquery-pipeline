@@ -1,5 +1,5 @@
 import os
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 import json
 import clickhouse_connect
 from datetime import datetime
@@ -10,7 +10,9 @@ CLICKHOUSE_PORT = int(os.environ.get('CLICKHOUSE_PORT', 8123))
 CLICKHOUSE_USER = os.environ['CLICKHOUSE_USER']
 CLICKHOUSE_PASSWORD = os.environ['CLICKHOUSE_PASSWORD']
 
-# The fields we EXPECT, and the Python type we expect each one to be
+VALID_TOPIC = 'cdc.public.invoices.valid'
+INVALID_TOPIC = 'cdc.public.invoices.invalid'
+
 EXPECTED_FIELDS = {
     'invoice_id': int,
     'customer_name': str,
@@ -18,6 +20,7 @@ EXPECTED_FIELDS = {
     'amount': dict,
     'updated_at': int,
     'due_date': int,
+    'tax_amount': (dict, type(None)),
 }
 
 client = clickhouse_connect.get_client(
@@ -34,6 +37,11 @@ consumer = KafkaConsumer(
     value_deserializer=lambda m: json.loads(m.decode('utf-8'))
 )
 
+producer = KafkaProducer(
+    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
+
 print("Gatekeeper listening for invoice changes...")
 
 for message in consumer:
@@ -48,7 +56,11 @@ for message in consumer:
             problems.append(f"missing field: {field}")
         elif not isinstance(after[field], expected_type):
             actual_type = type(after[field]).__name__
-            problems.append(f"wrong type for {field}: expected {expected_type.__name__}, got {actual_type}")
+            if isinstance(expected_type, tuple):
+                expected_name = " or ".join(t.__name__ for t in expected_type)
+            else:
+                expected_name = expected_type.__name__
+            problems.append(f"wrong type for {field}: expected {expected_name}, got {actual_type}")
 
     unexpected_fields = [f for f in after.keys() if f not in EXPECTED_FIELDS]
     if unexpected_fields:
@@ -62,6 +74,7 @@ for message in consumer:
             [[after.get('invoice_id', 0), json.dumps(event), reason, datetime.now()]],
             column_names=['invoice_id', 'raw_message', 'reason', 'event_ts']
         )
+        producer.send(INVALID_TOPIC, value=event)
     else:
         print(f"OK invoice_id={after['invoice_id']} customer={after['customer_name']}")
         client.insert(
@@ -69,3 +82,6 @@ for message in consumer:
             [[after['invoice_id'], after['customer_name'], after['status'], op, datetime.now()]],
             column_names=['invoice_id', 'customer_name', 'status', 'op', 'event_ts']
         )
+        producer.send(VALID_TOPIC, value=event)
+
+    producer.flush()
