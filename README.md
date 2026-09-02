@@ -2,9 +2,9 @@
 
 ## Objective
 
-Build a hands-on, real (non-simulated) Change Data Capture (CDC) pipeline covering the full lifecycle described in a target Data Engineering JD: ingestion via CDC, cloud-warehouse-style transformation, schema/data quality validation, status-lifecycle tracking, and scheduled orchestration — without using a managed framework like Spark.
+Build a hands-on, real (non-simulated) Change Data Capture (CDC) pipeline covering the full lifecycle described: ingestion via CDC, cloud-warehouse-style transformation, schema/data quality validation, status-lifecycle tracking, and scheduled orchestration — without using a managed framework like Spark.
 
-This project was built end-to-end, debugged from scratch, with every architectural decision — including three sink attempts (BigQuery, ClickHouse, Snowflake) — driven by real constraints hit during the build, documented below rather than glossed over. The final pipeline proves out **two working sinks in parallel**: a self-hosted ClickHouse instance and Snowflake (the JD's actual target warehouse), both fed from the same Kafka topic.
+This project was built end-to-end, debugged from scratch, with every architectural decision — including three sink attempts (BigQuery, ClickHouse, Snowflake) — driven by real constraints hit during the build, documented below rather than glossed over. The final pipeline proves out **two working sinks in parallel**: a self-hosted ClickHouse instance and Snowflake , both fed from the same Kafka topic.
 
 ## Final Architecture (fully working, automated)
 
