@@ -2,9 +2,9 @@
 
 ## Objective
 
-Build a hands-on, real (non-simulated) Change Data Capture (CDC) pipeline covering the full lifecycle described: ingestion via CDC, cloud-warehouse-style transformation, schema/data quality validation, status-lifecycle tracking, and scheduled orchestration — without using a managed framework like Spark.
+Build a hands-on, real (non-simulated) Change Data Capture (CDC) pipeline covering the full lifecycle described in a target Data Engineering JD: ingestion via CDC, cloud-warehouse-style transformation, schema/data quality validation, status-lifecycle tracking, and scheduled orchestration — without using a managed framework like Spark.
 
-This project was built end-to-end, debugged from scratch, with every architectural decision — including three sink attempts (BigQuery, ClickHouse, Snowflake) — driven by real constraints hit during the build, documented below rather than glossed over. The final pipeline proves out **two working sinks in parallel**: a self-hosted ClickHouse instance and Snowflake , both fed from the same Kafka topic.
+This project was built end-to-end, debugged from scratch, with every architectural decision — including three sink attempts (BigQuery, ClickHouse, Snowflake) — driven by real constraints hit during the build, documented below rather than glossed over. The final pipeline proves out **two working sinks in parallel**: a self-hosted ClickHouse instance and Snowflake (the JD's actual target warehouse), both fed from the same Kafka topic.
 
 ## Final Architecture (fully working, automated)
 
@@ -82,6 +82,8 @@ Since the target JD specifically requires Snowflake (not ClickHouse), the pipeli
 
 **Closing the validation gap**: the connector originally consumed directly from the raw `cdc.public.invoices` topic, meaning Snowflake received every event — including schema-broken ones — with no protection at all, unlike ClickHouse. Rather than writing Snowflake-specific validation logic, the connector was repointed to consume from `cdc.public.invoices.valid` instead (deleting and re-registering it with an updated `topics` config). This gave Snowflake the same protection as ClickHouse for free, since both now only ever see Gatekeeper-approved events. Verified by inspecting the raw Kafka topic directly (`kafka-console-consumer`) to confirm the split was working, then confirming the connector's own channel logs referenced the `.valid` topic by name post-switch. Along the way, a legitimate column (`tax_amount`, added earlier during schema-drift testing) was being incorrectly flagged as "unexpected" on every event because it had never been added to the Gatekeeper's `EXPECTED_FIELDS` — fixed by adding it with a type that allows `null`.
 
+**Full quarantine parity**: a second Snowflake sink connector (`invoices-snowflake-quarantine`) was added, consuming from `cdc.public.invoices.invalid` and writing into its own auto-created table (`CDC_RAW.INVOICES."cdc.public.invoices.invalid"`). This gives Snowflake the same clean/quarantine split ClickHouse already had — rejected events are never silently dropped on either sink, and both are now inspectable independently. One known asymmetry: ClickHouse's quarantine table stores the Gatekeeper's plain-English rejection reason alongside the raw event (`invoices_quarantine.reason`); Snowflake's quarantine table currently has only the raw event payload, since the Kafka message itself doesn't carry the reason — only ClickHouse gets it via a direct write from the Gatekeeper.
+
 ## Schema Change Scenarios — Tested Live, Not Theoretical
 
 Each of the following was deliberately caused on the running Postgres source and traced end-to-end through Kafka into the Gatekeeper's decision (ClickHouse path):
@@ -125,7 +127,7 @@ Writes to BigQuery failed with `Access Denied: BigQuery: Streaming insert is not
 2. **Formalize the Gatekeeper's schema contract**: move `EXPECTED_FIELDS` out of a hardcoded Python dict into a versioned config (e.g. JSON Schema).
 3. **Persistent volumes**: Postgres, Kafka, ClickHouse, and Airflow currently run without persistent Docker volumes, so state is lost on full recreation — observed and worked around directly multiple times, including across a full migration from GitHub Codespaces to a local machine and back.
 4. **Secrets handling maturity**: connector/service configs reference values via `.env` (git-ignored); the Snowflake private key required extra care beyond `.env` alone given the key-exposure incident — the next step for full production-readiness would be a proper secrets manager (e.g. HashiCorp Vault, cloud KMS) rather than plain environment variables, and a documented key-rotation runbook.
-5. **The invalid topic is currently a dead end**: `cdc.public.invoices.invalid` is written to but nothing consumes it yet beyond the Gatekeeper's own ClickHouse quarantine write — a small consumer or alert could surface these to a human for review.
+5. **Surface the Gatekeeper's rejection reason to Snowflake's quarantine too**: currently only ClickHouse's quarantine table carries the human-readable reason a record was rejected; Snowflake's quarantine table has the raw payload only, since that detail isn't part of the Kafka message itself.
 
 ## Key Lessons (for interview discussion)
 
