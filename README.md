@@ -15,14 +15,16 @@ Postgres (source DB)
 Debezium (Postgres source connector, runs inside Kafka Connect)
    │  captures INSERT / UPDATE / DELETE as structured events
    ▼
-Kafka (topic: cdc.public.invoices)
+Kafka (topic: cdc.public.invoices — raw)
    │  durable, ordered event stream
-   ├────────────────────────────────────┐
-   ▼                                    ▼
-Gatekeeper (Python, always-on)   Snowflake Kafka Connector
-   │  validates fields               (official plugin, key-pair auth)
-   ├── valid   → ClickHouse: invoices_typed          ▼
-   └── invalid → ClickHouse: invoices_quarantine   Snowflake: CDC_RAW.INVOICES."cdc.public.invoices"
+   ▼
+Gatekeeper (Python, always-on)
+   │  validates fields: presence, type, unexpected new fields
+   ├── valid   → Kafka topic: cdc.public.invoices.valid
+   │                 ├── ClickHouse: invoices_typed (direct write)
+   │                 └── Snowflake Kafka Connector → CDC_RAW.INVOICES."cdc.public.invoices.valid"
+   └── invalid → Kafka topic: cdc.public.invoices.invalid
+                     └── ClickHouse: invoices_quarantine (direct write)
                         │
                         ▼
               dbt (scheduled by Airflow, every 15 min)
@@ -30,6 +32,8 @@ Gatekeeper (Python, always-on)   Snowflake Kafka Connector
                         ├── dbt run  → dim_invoices_current (deduplicated, one row per invoice, latest state)
                         └── dbt test → not_null + unique checks on the model
 ```
+
+**Key architectural point**: the Gatekeeper is the single validation checkpoint for the entire pipeline. Rather than duplicating validation logic per destination, it republishes validated events into their own Kafka topics (`.valid` / `.invalid`). Both ClickHouse and Snowflake — and any future sink — consume only from the `.valid` topic, so every downstream consumer is protected without needing any validation code of its own. This was a deliberate correction: Snowflake originally consumed directly from the raw topic and had no protection at all; repointing it to the validated topic closed that gap without touching the Snowflake connector's own logic.
 
 All services run in Docker Compose — locally on a personal machine or in a GitHub Codespace. No cloud billing required for the ClickHouse path; the Snowflake path uses a free trial account.
 
@@ -42,7 +46,7 @@ All services run in Docker Compose — locally on a personal machine or in a Git
 - **Sink — attempt 1 (BigQuery, not used further)**: WePay/Confluent's `kafka-connect-bigquery` connector was installed and successfully registered, but writes failed with `Access Denied: Streaming insert is not allowed in the free tier` — a GCP billing policy restriction, confirmed via connector logs, not a pipeline defect.
 - **Sink — ClickHouse (working)**: Self-hosted ClickHouse, consuming from Kafka via its native `Kafka` table engine + materialized view, no Kafka Connect plugin required.
 - **Sink — Snowflake (working)**: See dedicated section below.
-- **Gatekeeper**: A standalone, always-on Python service (`kafka-python` + `clickhouse-connect`) consuming directly from Kafka, feeding the ClickHouse path. Before trusting any event, it checks: are all expected fields **present**? Are they the **correct type**? Are there any **unexpected new fields**? Valid events go to `invoices_typed`; anything failing any check goes to `invoices_quarantine` with the full raw event and an exact, human-readable reason.
+- **Gatekeeper**: A standalone, always-on Python service (`kafka-python` + `clickhouse-connect`) consuming from the raw Kafka topic. Before trusting any event, it checks: are all expected fields **present**? Are they the **correct type**? Are there any **unexpected new fields**? Valid events are written to ClickHouse's `invoices_typed` table **and** republished to a new Kafka topic, `cdc.public.invoices.valid`; invalid events go to `invoices_quarantine` (with the full raw event and an exact reason) and are republished to `cdc.public.invoices.invalid`. This makes the Gatekeeper a shared validation checkpoint for the whole pipeline — see Phase 4 for how this closed a real protection gap for Snowflake.
 
 ### Phase 2 — Transformation Layer (dbt)
 - dbt-core + `dbt-clickhouse` adapter, containerized, connected via environment variables (no hardcoded credentials).
@@ -76,6 +80,8 @@ Since the target JD specifically requires Snowflake (not ClickHouse), the pipeli
 
 **Result — verified with real data**: rows inserted into Postgres are visible end-to-end in Snowflake within seconds, with `rowsInsertedCount` incrementing and `rowsErrorCount=0` in the connector's own status logs, and confirmed directly via `SELECT` against the Snowflake table showing the full Debezium event payload (`RECORD_METADATA`, `SCHEMA`, `PAYLOAD` columns, Snowflake's default ingestion schema for schemaless JSON).
 
+**Closing the validation gap**: the connector originally consumed directly from the raw `cdc.public.invoices` topic, meaning Snowflake received every event — including schema-broken ones — with no protection at all, unlike ClickHouse. Rather than writing Snowflake-specific validation logic, the connector was repointed to consume from `cdc.public.invoices.valid` instead (deleting and re-registering it with an updated `topics` config). This gave Snowflake the same protection as ClickHouse for free, since both now only ever see Gatekeeper-approved events. Verified by inspecting the raw Kafka topic directly (`kafka-console-consumer`) to confirm the split was working, then confirming the connector's own channel logs referenced the `.valid` topic by name post-switch. Along the way, a legitimate column (`tax_amount`, added earlier during schema-drift testing) was being incorrectly flagged as "unexpected" on every event because it had never been added to the Gatekeeper's `EXPECTED_FIELDS` — fixed by adding it with a type that allows `null`.
+
 ## Schema Change Scenarios — Tested Live, Not Theoretical
 
 Each of the following was deliberately caused on the running Postgres source and traced end-to-end through Kafka into the Gatekeeper's decision (ClickHouse path):
@@ -97,7 +103,7 @@ Each of the following was deliberately caused on the running Postgres source and
 | Sink (attempted, not used) | WePay/Confluent `kafka-connect-bigquery` → Google BigQuery |
 | Sink (working) | ClickHouse (native Kafka table engine + materialized view) |
 | Sink (working, matches JD) | Snowflake (official Kafka Connector, Snowpipe Streaming, key-pair auth) |
-| Schema validation | Standalone Python service (`kafka-python` + `clickhouse-connect`), always-on container |
+| Schema validation | Standalone Python service (`kafka-python` + `clickhouse-connect` + `kafka-python` producer), always-on container; republishes to `cdc.public.invoices.valid` / `.invalid` Kafka topics so both sinks share one validation checkpoint |
 | Transformation | dbt-core + dbt-clickhouse, containerized |
 | Orchestration | Apache Airflow 2.9.3 (standalone mode, `DockerOperator`), containerized |
 | Reconciliation | Standalone Python service comparing Postgres source vs. ClickHouse destination counts |
@@ -107,7 +113,7 @@ Each of the following was deliberately caused on the running Postgres source and
 
 ## Result
 
-The pipeline runs continuously and unattended, end to end, feeding two independent, verified sinks from a single Kafka topic. A row inserted into Postgres — clean or schema-broken — is captured by Debezium, streamed through Kafka, and simultaneously: evaluated by the Gatekeeper and landed in ClickHouse (clean or quarantine), and written directly into Snowflake by the official connector. Airflow's scheduled dbt run rebuilds and re-tests the ClickHouse-side current-state table automatically, with a reconciliation check confirming source/destination counts match.
+The pipeline runs continuously and unattended, end to end, feeding two independent, verified sinks from a single validation checkpoint. A row inserted into Postgres — clean or schema-broken — is captured by Debezium, streamed through Kafka, and evaluated once by the Gatekeeper, which sorts it into a validated or invalid Kafka topic. Both ClickHouse and Snowflake consume only from the validated topic, so neither ever sees schema-broken data. Airflow's scheduled dbt run rebuilds and re-tests the ClickHouse-side current-state table automatically, with a reconciliation check confirming source/destination counts match.
 
 ## BigQuery Attempt (documented, not abandoned lightly)
 
@@ -119,6 +125,7 @@ Writes to BigQuery failed with `Access Denied: BigQuery: Streaming insert is not
 2. **Formalize the Gatekeeper's schema contract**: move `EXPECTED_FIELDS` out of a hardcoded Python dict into a versioned config (e.g. JSON Schema).
 3. **Persistent volumes**: Postgres, Kafka, ClickHouse, and Airflow currently run without persistent Docker volumes, so state is lost on full recreation — observed and worked around directly multiple times, including across a full migration from GitHub Codespaces to a local machine and back.
 4. **Secrets handling maturity**: connector/service configs reference values via `.env` (git-ignored); the Snowflake private key required extra care beyond `.env` alone given the key-exposure incident — the next step for full production-readiness would be a proper secrets manager (e.g. HashiCorp Vault, cloud KMS) rather than plain environment variables, and a documented key-rotation runbook.
+5. **The invalid topic is currently a dead end**: `cdc.public.invoices.invalid` is written to but nothing consumes it yet beyond the Gatekeeper's own ClickHouse quarantine write — a small consumer or alert could surface these to a human for review.
 
 ## Key Lessons (for interview discussion)
 
@@ -127,6 +134,7 @@ Writes to BigQuery failed with `Access Denied: BigQuery: Streaming insert is not
 - Schema mismatch protection has (at least) three distinct failure modes, each needing separate handling: **missing/renamed fields**, **type changes**, and **unexpected new fields** — a presence-only check misses the second and third categories entirely.
 - Silent failure is the real danger in schema drift, not crashes: raw JSON-extraction functions often return an empty value on a missing field by default rather than erroring.
 - A quarantine pattern (route invalid records to a separate table with full raw payload + reason) preserves both auditability and uptime.
+- Validation is cheaper to build once, upstream, than per-destination: republishing validated events into their own Kafka topic (rather than teaching every sink its own validation rules) meant a second consumer (Snowflake) could be added later and inherit full protection with zero new validation code — the fix was a one-line config change (`topics`), not new logic.
 - Role-based access in a real warehouse applies even to admin accounts by default: a table created by a service role was invisible to `ACCOUNTADMIN` until an explicit `GRANT SELECT` was issued — a good illustration of least-privilege design working as intended, not a bug.
 - **Handling a real credential exposure**: when a private key was inadvertently displayed in a debugging session, the correct response was immediate rotation — revoke the exposed key, generate a fresh pair, reattach the new public key, and change tooling (output suppression) to prevent recurrence — rather than assuming a low-actual-risk situation meant no action was needed. Documented here deliberately, since recognizing and correctly responding to this kind of incident is itself a relevant, assessable skill.
 - Connector configuration errors from mature, well-maintained plugins (Snowflake's, in this case) tend to be genuinely actionable — the exact missing/invalid config keys were enumerated directly in the error response, in contrast to vaguer failures seen with less mature tooling.
