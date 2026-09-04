@@ -2,9 +2,9 @@
 
 ## Objective
 
-Build a hands-on, real (non-simulated) Change Data Capture (CDC) pipeline covering the full lifecycle described in a target Data Engineering JD: ingestion via CDC, cloud-warehouse-style transformation, schema/data quality validation, status-lifecycle tracking, and scheduled orchestration — without using a managed framework like Spark.
+Build a hands-on, real (non-simulated) Change Data Capture (CDC) pipeline covering the full lifecycle of streaming data into a warehouse: ingestion via CDC, cloud-warehouse-style transformation, schema/data quality validation, status-lifecycle tracking, and scheduled orchestration — without using a managed framework like Spark.
 
-This project was built end-to-end, debugged from scratch, with every architectural decision — including three sink attempts (BigQuery, ClickHouse, Snowflake) — driven by real constraints hit during the build, documented below rather than glossed over. The final pipeline proves out **two working sinks in parallel**: a self-hosted ClickHouse instance and Snowflake (the JD's actual target warehouse), both fed from the same Kafka topic.
+This project was built end-to-end, debugged from scratch, with every architectural decision — including three sink attempts (BigQuery, ClickHouse, Snowflake) — driven by real constraints hit during the build, documented below rather than glossed over. The final pipeline proves out **two working sinks in parallel**: a self-hosted ClickHouse instance and Snowflake, both fed from the same Kafka topic.
 
 ## Final Architecture (fully working, automated)
 
@@ -50,18 +50,18 @@ All services run in Docker Compose — locally on a personal machine or in a Git
 
 ### Phase 2 — Transformation Layer (dbt)
 - dbt-core + `dbt-clickhouse` adapter, containerized, connected via environment variables (no hardcoded credentials).
-- Model `dim_invoices_current`: deduplicates the raw event log (`invoices_typed`) down to exactly one row per `invoice_id`, using `ROW_NUMBER() OVER (PARTITION BY invoice_id ORDER BY event_ts DESC)` — the "current state" table matching the JD's "status-processing mechanisms to track invoice transactions throughout the lifecycle." Full event history remains intact in `invoices_typed` for audit/reconciliation.
+- Model `dim_invoices_current`: deduplicates the raw event log (`invoices_typed`) down to exactly one row per `invoice_id`, using `ROW_NUMBER() OVER (PARTITION BY invoice_id ORDER BY event_ts DESC)` — a "current state" table tracking each invoice's latest lifecycle status. Full event history remains intact in `invoices_typed` for audit/reconciliation.
 - dbt tests (`not_null`, `unique`) as the standardized, declarative counterpart to the Gatekeeper's hand-written Python checks.
 
 ### Phase 3 — Orchestration (Airflow) and Reconciliation
 - Airflow 2.9.3, standalone mode, containerized, fixed admin credentials via `.env`.
 - DAG `invoice_pipeline`, scheduled every 15 minutes, three tasks in dependency order: `dbt_run >> dbt_test >> reconciliation`.
 - Built using `DockerOperator` — each task spins up a fresh, isolated container on the same Docker network, runs, and cleans up. Chosen over `BashOperator` after discovering the latter would require installing Docker CLI tools inside the Airflow image itself.
-- **Reconciliation**: a standalone Python service comparing Postgres source row counts against the ClickHouse `dim_invoices_current` count, logging a clear PASS/FAIL — directly implementing the JD's "data reconciliation" requirement.
+- **Reconciliation**: a standalone Python service comparing Postgres source row counts against the ClickHouse `dim_invoices_current` count, logging a clear PASS/FAIL.
 
-### Phase 4 — Snowflake as a Second, Production-Matching Sink
+### Phase 4 — Snowflake as a Second Sink
 
-Since the target JD specifically requires Snowflake (not ClickHouse), the pipeline was extended to feed Snowflake in parallel from the same Kafka topic, using the officially maintained Snowflake Kafka Connector — proving the architecture against the actual target warehouse, not just a substitute.
+Since Snowflake is a common target warehouse in real-world data engineering roles, the pipeline was extended to feed it in parallel from the same Kafka topic, using the officially maintained Snowflake Kafka Connector — proving the architecture against a genuine cloud warehouse, not just a self-hosted substitute.
 
 **Setup performed (all scripted, in `snowflake/setup.sql`):**
 - A dedicated, auto-suspending warehouse (`CDC_WH`, XSMALL, so it doesn't burn credits while idle)
@@ -104,7 +104,7 @@ Each of the following was deliberately caused on the running Postgres source and
 | Connector runtime | Kafka Connect (Confluent `cp-kafka-connect:7.6.1` base image, custom-built) |
 | Sink (attempted, not used) | WePay/Confluent `kafka-connect-bigquery` → Google BigQuery |
 | Sink (working) | ClickHouse (native Kafka table engine + materialized view) |
-| Sink (working, matches JD) | Snowflake (official Kafka Connector, Snowpipe Streaming, key-pair auth) |
+| Sink (working) | Snowflake (official Kafka Connector, Snowpipe Streaming, key-pair auth) |
 | Schema validation | Standalone Python service (`kafka-python` + `clickhouse-connect` + `kafka-python` producer), always-on container; republishes to `cdc.public.invoices.valid` / `.invalid` Kafka topics so both sinks share one validation checkpoint |
 | Transformation | dbt-core + dbt-clickhouse, containerized |
 | Orchestration | Apache Airflow 2.9.3 (standalone mode, `DockerOperator`), containerized |
@@ -119,11 +119,11 @@ The pipeline runs continuously and unattended, end to end, feeding two independe
 
 ## BigQuery Attempt (documented, not abandoned lightly)
 
-Writes to BigQuery failed with `Access Denied: BigQuery: Streaming insert is not allowed in the free tier` — a Google Cloud billing policy restriction on Sandbox/free-tier projects, which also blocks provisioning the GCS bucket needed for the batch-load alternative. Diagnosis was confirmed via connector logs, validating every upstream layer was functioning correctly right up to the final write call. The sink was switched to self-hosted ClickHouse, and later, Snowflake was added as the JD-matching production target.
+Writes to BigQuery failed with `Access Denied: BigQuery: Streaming insert is not allowed in the free tier` — a Google Cloud billing policy restriction on Sandbox/free-tier projects, which also blocks provisioning the GCS bucket needed for the batch-load alternative. Diagnosis was confirmed via connector logs, validating every upstream layer was functioning correctly right up to the final write call. The sink was switched to self-hosted ClickHouse, and later, Snowflake was added as a second target.
 
 ## Room for Improvement / Next Steps
 
-1. **Point dbt at Snowflake too**: currently dbt only transforms the ClickHouse-side data; adding a Snowflake target/profile would let the same `dim_invoices_current` logic run against the JD's actual warehouse.
+1. **Point dbt at Snowflake too**: currently dbt only transforms the ClickHouse-side data; adding a Snowflake target/profile would let the same `dim_invoices_current` logic run against Snowflake directly.
 2. **Formalize the Gatekeeper's schema contract**: move `EXPECTED_FIELDS` out of a hardcoded Python dict into a versioned config (e.g. JSON Schema).
 3. **Persistent volumes**: Postgres, Kafka, ClickHouse, and Airflow currently run without persistent Docker volumes, so state is lost on full recreation — observed and worked around directly multiple times, including across a full migration from GitHub Codespaces to a local machine and back.
 4. **Secrets handling maturity**: connector/service configs reference values via `.env` (git-ignored); the Snowflake private key required extra care beyond `.env` alone given the key-exposure incident — the next step for full production-readiness would be a proper secrets manager (e.g. HashiCorp Vault, cloud KMS) rather than plain environment variables, and a documented key-rotation runbook.
