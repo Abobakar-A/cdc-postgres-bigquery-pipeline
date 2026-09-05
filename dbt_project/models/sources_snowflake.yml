@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: snowflake_raw
+    database: CDC_RAW
+    schema: INVOICES
+    tables:
+      - name: cdc_public_invoices_valid
+        identifier: '"cdc.public.invoices.valid"'

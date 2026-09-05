@@ -17,3 +17,19 @@ models:
         description: "Current status of the invoice."
         tests:
           - not_null
+  - name: dim_invoices_current_snowflake
+    description: "One row per invoice, showing its latest known status (Snowflake target)."
+    columns:
+      - name: invoice_id
+        description: "Unique identifier for each invoice."
+        tests:
+          - not_null
+          - unique
+      - name: customer_name
+        description: "Customer name on the invoice."
+        tests:
+          - not_null
+      - name: status
+        description: "Current status of the invoice."
+        tests:
+          - not_null
