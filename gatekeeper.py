@@ -74,7 +74,9 @@ for message in consumer:
             [[after.get('invoice_id', 0), json.dumps(event), reason, datetime.now()]],
             column_names=['invoice_id', 'raw_message', 'reason', 'event_ts']
         )
-        producer.send(INVALID_TOPIC, value=event)
+        enriched_event = dict(event)
+        enriched_event['_quarantine_reason'] = reason
+        producer.send(INVALID_TOPIC, value=enriched_event)
     else:
         print(f"OK invoice_id={after['invoice_id']} customer={after['customer_name']}")
         client.insert(
