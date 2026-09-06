@@ -106,7 +106,7 @@ Each of the following was deliberately caused on the running Postgres source and
 | Sink (working) | ClickHouse (native Kafka table engine + materialized view) |
 | Sink (working) | Snowflake (official Kafka Connector, Snowpipe Streaming, key-pair auth) |
 | Schema validation | Standalone Python service (`kafka-python` + `clickhouse-connect` + `kafka-python` producer), always-on container; republishes to `cdc.public.invoices.valid` / `.invalid` Kafka topics so both sinks share one validation checkpoint |
-| Transformation | dbt-core + dbt-clickhouse, containerized |
+| Transformation | dbt-core + dbt-clickhouse + dbt-snowflake, containerized, one model per warehouse |
 | Orchestration | Apache Airflow 2.9.3 (standalone mode, `DockerOperator`), containerized |
 | Reconciliation | Standalone Python service comparing Postgres source vs. ClickHouse destination counts |
 | Infra orchestration | Docker Compose, all long-running services `restart: unless-stopped` |
@@ -115,19 +115,36 @@ Each of the following was deliberately caused on the running Postgres source and
 
 ## Result
 
-The pipeline runs continuously and unattended, end to end, feeding two independent, verified sinks from a single validation checkpoint. A row inserted into Postgres — clean or schema-broken — is captured by Debezium, streamed through Kafka, and evaluated once by the Gatekeeper, which sorts it into a validated or invalid Kafka topic. Both ClickHouse and Snowflake consume only from the validated topic, so neither ever sees schema-broken data. Airflow's scheduled dbt run rebuilds and re-tests the ClickHouse-side current-state table automatically, with a reconciliation check confirming source/destination counts match.
+The pipeline runs continuously and unattended, end to end, feeding two independent, verified sinks from a single validation checkpoint. A row inserted into Postgres — clean or schema-broken — is captured by Debezium, streamed through Kafka, and evaluated once by the Gatekeeper, which sorts it into a validated or invalid Kafka topic. Both ClickHouse and Snowflake consume only from the validated topic (and both have their own quarantine table for rejected events), so neither ever sees schema-broken data undetected. Airflow's scheduled DAG runs dbt against both warehouses in parallel — rebuilding and re-testing each one's current-state table — plus a reconciliation check confirming Postgres and the ClickHouse destination counts match.
 
 ## BigQuery Attempt (documented, not abandoned lightly)
 
 Writes to BigQuery failed with `Access Denied: BigQuery: Streaming insert is not allowed in the free tier` — a Google Cloud billing policy restriction on Sandbox/free-tier projects, which also blocks provisioning the GCS bucket needed for the batch-load alternative. Diagnosis was confirmed via connector logs, validating every upstream layer was functioning correctly right up to the final write call. The sink was switched to self-hosted ClickHouse, and later, Snowflake was added as a second target.
 
+### Phase 5 — dbt and Airflow Extended to Snowflake
+
+The dbt project was extended with a second target profile (`snowflake`, alongside the original `dev`/ClickHouse target), using the `dbt-snowflake` adapter and the same key-pair authentication already set up for the Kafka connector.
+
+- **Model `dim_invoices_current_snowflake`**: parses the Debezium event out of Snowflake's raw `PAYLOAD` JSON column (`PAYLOAD:after:invoice_id::INT`, etc.) and applies the same `ROW_NUMBER()` deduplication logic as the ClickHouse model — same business rule, different SQL dialect, since Snowflake's raw landing table stores the whole event as JSON rather than pre-parsed columns.
+- **A real dialect issue, found and fixed**: the raw Snowflake table name (`cdc.public.invoices.valid`, with literal dots) needed to be explicitly double-quoted in dbt's `source` definition (`identifier: '"cdc.public.invoices.valid"'`) — without it, Snowflake parsed the dots as database/schema/table separators and failed with "too many qualifiers."
+- **Tests**: the same `not_null` / `unique` checks as the ClickHouse model, run independently against Snowflake — confirmed passing (4/4) on real data.
+- **Airflow integration, and a genuine model-selection bug**: two new DAG tasks (`dbt_run_snowflake >> dbt_test_snowflake`) were added as an independent branch alongside the existing ClickHouse chain. The first attempt broke the ClickHouse tasks: `dbt run` with no model selection tries to build *every* model in the project against whichever target is active, so the ClickHouse task attempted to compile Snowflake-specific syntax (`PAYLOAD:after:invoice_id::INT`) as ClickHouse SQL and failed with a syntax error. Fixed by scoping every dbt task explicitly with `--select <model_name>`, so each warehouse's task only ever touches its own model.
+
+### Phase 6 — Shared Validation Checkpoint (Gatekeeper Protects Both Sinks)
+
+Originally, the Snowflake Kafka Connector consumed directly from the raw `cdc.public.invoices` topic, meaning Snowflake received every event — including schema-broken ones — with no protection at all, unlike ClickHouse's Gatekeeper-mediated path. Two changes closed this gap:
+
+1. **The Gatekeeper now produces to Kafka, not just ClickHouse.** After validating each event (same presence/type/unexpected-field checks as before), it republishes the event into one of two new Kafka topics — `cdc.public.invoices.valid` or `cdc.public.invoices.invalid` — in addition to its existing ClickHouse writes.
+2. **Both Snowflake connectors were repointed to consume from these topics** instead of the raw one: the main sink now reads only `cdc.public.invoices.valid`, and a second, new connector (`invoices-snowflake-quarantine`) was added consuming `cdc.public.invoices.invalid` into its own auto-created Snowflake table — giving Snowflake full clean/quarantine parity with ClickHouse, verified by querying both new tables directly and confirming the previously-quarantined test invoices appeared correctly on the Snowflake side too.
+
+This is a deliberate architectural choice: validation happens once, upstream, and is inherited automatically by every downstream consumer via Kafka topic routing — adding a third sink in the future would require zero new validation code, only pointing it at the existing `.valid` topic. One remaining asymmetry: ClickHouse's quarantine table stores the Gatekeeper's plain-English rejection reason directly (via its separate direct write); Snowflake's quarantine table has only the raw event, since that reason isn't part of the Kafka message itself.
+
 ## Room for Improvement / Next Steps
 
-1. **Point dbt at Snowflake too**: currently dbt only transforms the ClickHouse-side data; adding a Snowflake target/profile would let the same `dim_invoices_current` logic run against Snowflake directly.
+1. **Surface the Gatekeeper's rejection reason in Snowflake's quarantine too**: currently only ClickHouse's quarantine table carries the human-readable reason a record was rejected; Snowflake's quarantine table has the raw payload only, since that detail isn't part of the Kafka message itself.
 2. **Formalize the Gatekeeper's schema contract**: move `EXPECTED_FIELDS` out of a hardcoded Python dict into a versioned config (e.g. JSON Schema).
 3. **Persistent volumes**: Postgres, Kafka, ClickHouse, and Airflow currently run without persistent Docker volumes, so state is lost on full recreation — observed and worked around directly multiple times, including across a full migration from GitHub Codespaces to a local machine and back.
 4. **Secrets handling maturity**: connector/service configs reference values via `.env` (git-ignored); the Snowflake private key required extra care beyond `.env` alone given the key-exposure incident — the next step for full production-readiness would be a proper secrets manager (e.g. HashiCorp Vault, cloud KMS) rather than plain environment variables, and a documented key-rotation runbook.
-5. **Surface the Gatekeeper's rejection reason to Snowflake's quarantine too**: currently only ClickHouse's quarantine table carries the human-readable reason a record was rejected; Snowflake's quarantine table has the raw payload only, since that detail isn't part of the Kafka message itself.
 
 ## Key Lessons (for interview discussion)
 
