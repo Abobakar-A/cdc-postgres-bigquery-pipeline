@@ -146,7 +146,7 @@ This is a deliberate architectural choice: validation happens once, upstream, an
 3. **Persistent volumes**: Postgres, Kafka, ClickHouse, and Airflow currently run without persistent Docker volumes, so state is lost on full recreation — observed and worked around directly multiple times, including across a full migration from GitHub Codespaces to a local machine and back.
 4. **Secrets handling maturity**: connector/service configs reference values via `.env` (git-ignored); the Snowflake private key required extra care beyond `.env` alone given the key-exposure incident — the next step for full production-readiness would be a proper secrets manager (e.g. HashiCorp Vault, cloud KMS) rather than plain environment variables, and a documented key-rotation runbook.
 
-## Key Lessons (for interview discussion)
+## Key Lessons 
 
 - CDC's core idea — read the database's change log instead of polling/batch-querying — is universal across databases, but each database has its own knob determining how much detail is captured on UPDATE/DELETE (Postgres: `REPLICA IDENTITY`; MySQL: `binlog_format=ROW`; SQL Server: native CDC capture instances).
 - Every warehouse vendor has its own authentication model for automated services, and they are not interchangeable: ClickHouse used simple username/password; BigQuery used a service-account JSON key; Snowflake's Kafka Connector required RSA key-pair authentication specifically, with the private key needed inline in config (not as a file reference) — a real constraint that shaped how secrets had to be handled.
