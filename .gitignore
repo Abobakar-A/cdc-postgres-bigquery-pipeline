@@ -1,6 +1,7 @@
 .env
 *.json
 !package.json
+!schema_contract.json
 secrets/
 gatekeeper_env/dbt_project/logs/
 dbt_project/target/

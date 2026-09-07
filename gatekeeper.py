@@ -1,6 +1,7 @@
 import os
-from kafka import KafkaConsumer, KafkaProducer
 import json
+import builtins
+from kafka import KafkaConsumer, KafkaProducer
 import clickhouse_connect
 from datetime import datetime
 
@@ -13,15 +14,21 @@ CLICKHOUSE_PASSWORD = os.environ['CLICKHOUSE_PASSWORD']
 VALID_TOPIC = 'cdc.public.invoices.valid'
 INVALID_TOPIC = 'cdc.public.invoices.invalid'
 
-EXPECTED_FIELDS = {
-    'invoice_id': int,
-    'customer_name': str,
-    'status': str,
-    'amount': dict,
-    'updated_at': int,
-    'due_date': int,
-    'tax_amount': (dict, type(None)),
-}
+# Load the schema contract from an external JSON file, so the expected
+# shape of an invoice event can be reviewed/edited without touching code.
+with open('schema_contract.json') as f:
+    raw_contract = json.load(f)
+
+def resolve_type(name):
+    """Turn a string like 'int' or 'NoneType' into the actual Python type."""
+    return type(None) if name == 'NoneType' else getattr(builtins, name)
+
+EXPECTED_FIELDS = {}
+for field, type_names in raw_contract.items():
+    if isinstance(type_names, list):
+        EXPECTED_FIELDS[field] = tuple(resolve_type(t) for t in type_names)
+    else:
+        EXPECTED_FIELDS[field] = resolve_type(type_names)
 
 client = clickhouse_connect.get_client(
     host=CLICKHOUSE_HOST,
@@ -42,7 +49,7 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
-print("Gatekeeper listening for invoice changes...")
+print(f"Gatekeeper listening for invoice changes... (schema contract: {list(EXPECTED_FIELDS.keys())})")
 
 for message in consumer:
     event = message.value

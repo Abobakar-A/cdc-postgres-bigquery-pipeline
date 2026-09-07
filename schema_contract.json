@@ -1,0 +1,9 @@
+{
+  "invoice_id": "int",
+  "customer_name": "str",
+  "status": "str",
+  "amount": "dict",
+  "updated_at": "int",
+  "due_date": "int",
+  "tax_amount": ["dict", "NoneType"]
+}
