@@ -14,12 +14,17 @@ services:
       - "postgres"
       - "-c"
       - "wal_level=logical"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
   zookeeper:
     image: quay.io/debezium/zookeeper:2.5
     container_name: zookeeper
     ports:
       - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
 
   kafka:
     image: quay.io/debezium/kafka:2.5
@@ -30,6 +35,8 @@ services:
       - zookeeper
     environment:
       - ZOOKEEPER_CONNECT=zookeeper:2181
+    volumes:
+      - kafka_data:/var/lib/kafka/data
 
   connect:
     build:
@@ -73,6 +80,8 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
 
   gatekeeper:
     build:
@@ -130,6 +139,7 @@ services:
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - /var/run/docker.sock:/var/run/docker.sock
+      - airflow_data:/opt/airflow
     user: "0:0"
 
   reconciliation:
@@ -145,3 +155,11 @@ services:
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+
+volumes:
+  postgres_data:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
+  clickhouse_data:
+  airflow_data:

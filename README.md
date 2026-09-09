@@ -109,7 +109,7 @@ Each of the following was deliberately caused on the running Postgres source and
 | Transformation | dbt-core + dbt-clickhouse + dbt-snowflake, containerized, one model per warehouse |
 | Orchestration | Apache Airflow 2.9.3 (standalone mode, `DockerOperator`), containerized |
 | Reconciliation | Standalone Python service comparing Postgres source vs. ClickHouse destination counts |
-| Infra orchestration | Docker Compose, all long-running services `restart: unless-stopped` |
+| Infra orchestration | Docker Compose, all long-running services `restart: unless-stopped`, named volumes on every stateful service |
 | Environment | GitHub Codespaces / local Docker (Ubuntu) — pipeline verified portable across both |
 | Planned but not yet implemented | dbt model + tests targeting the Snowflake table directly (currently dbt only targets ClickHouse) |
 
@@ -141,13 +141,16 @@ This is a deliberate architectural choice: validation happens once, upstream, an
 
 ## Room for Improvement / Next Steps
 
-1. **Surface the Gatekeeper's rejection reason in Snowflake's quarantine too**: currently only ClickHouse's quarantine table carries the human-readable reason a record was rejected; Snowflake's quarantine table has the raw payload only, since that detail isn't part of the Kafka message itself.
-2. **Formalize the Gatekeeper's schema contract**: move `EXPECTED_FIELDS` out of a hardcoded Python dict into a versioned config (e.g. JSON Schema).
-3. **Persistent volumes**: Postgres, Kafka, ClickHouse, and Airflow currently run without persistent Docker volumes, so state is lost on full recreation — observed and worked around directly multiple times, including across a full migration from GitHub Codespaces to a local machine and back.
-4. **Secrets handling maturity**: connector/service configs reference values via `.env` (git-ignored); the Snowflake private key required extra care beyond `.env` alone given the key-exposure incident — the next step for full production-readiness would be a proper secrets manager (e.g. HashiCorp Vault, cloud KMS) rather than plain environment variables, and a documented key-rotation runbook.
+1. **Secrets handling maturity**: connector/service configs reference values via `.env` (git-ignored); the Snowflake private key required extra care beyond `.env` alone given the key-exposure incident — the next step for full production-readiness would be a proper secrets manager (e.g. HashiCorp Vault, cloud KMS) rather than plain environment variables, and a documented key-rotation runbook.
 
 ## Key Lessons 
 
+- Docker containers without named volumes lose all state on recreation — this was hit repeatedly throughout the project (source tables, connector registrations, and Airflow's admin user all needed re-creating after restarts, including across a full migration from GitHub Codespaces to a local machine and back). Fixed by adding named volumes for every stateful service (`postgres`, `zookeeper`, `kafka`, `clickhouse`, `airflow`) and verified directly: a test row inserted into Postgres survived a full `docker compose rm` + recreate of the container, confirming the fix works rather than assuming it does from the config alone.
+
+- Validation rules belong in data, not code: the Gatekeeper's expected-fields contract was originally a hardcoded Python dict; moving it into an external `schema_contract.json` file (loaded at startup, types resolved from string names) means the schema contract can be reviewed, diffed, and edited by someone without touching application logic — a small change with a real production-readiness payoff.
+
+- A single dbt project serving multiple warehouse targets must scope every run explicitly with `--select <model>`: `dbt run` with no selection tries to build every model against whichever target is active, so a model written in one warehouse's SQL dialect (e.g. Snowflake's `PAYLOAD:field::TYPE` syntax) will fail loudly against another (ClickHouse) if not excluded — caught directly from Airflow task logs, not assumed away.
+- Table or column identifiers containing characters outside normal SQL naming (like literal dots, from a Kafka topic name such as `cdc.public.invoices.valid`) must be explicitly quoted in dbt source definitions, or the database will misinterpret the dots as path separators between database/schema/table and reject the query as having "too many qualifiers."
 - CDC's core idea — read the database's change log instead of polling/batch-querying — is universal across databases, but each database has its own knob determining how much detail is captured on UPDATE/DELETE (Postgres: `REPLICA IDENTITY`; MySQL: `binlog_format=ROW`; SQL Server: native CDC capture instances).
 - Every warehouse vendor has its own authentication model for automated services, and they are not interchangeable: ClickHouse used simple username/password; BigQuery used a service-account JSON key; Snowflake's Kafka Connector required RSA key-pair authentication specifically, with the private key needed inline in config (not as a file reference) — a real constraint that shaped how secrets had to be handled.
 - Schema mismatch protection has (at least) three distinct failure modes, each needing separate handling: **missing/renamed fields**, **type changes**, and **unexpected new fields** — a presence-only check misses the second and third categories entirely.
@@ -157,4 +160,3 @@ This is a deliberate architectural choice: validation happens once, upstream, an
 - Role-based access in a real warehouse applies even to admin accounts by default: a table created by a service role was invisible to `ACCOUNTADMIN` until an explicit `GRANT SELECT` was issued — a good illustration of least-privilege design working as intended, not a bug.
 - **Handling a real credential exposure**: when a private key was inadvertently displayed in a debugging session, the correct response was immediate rotation — revoke the exposed key, generate a fresh pair, reattach the new public key, and change tooling (output suppression) to prevent recurrence — rather than assuming a low-actual-risk situation meant no action was needed. Documented here deliberately, since recognizing and correctly responding to this kind of incident is itself a relevant, assessable skill.
 - Connector configuration errors from mature, well-maintained plugins (Snowflake's, in this case) tend to be genuinely actionable — the exact missing/invalid config keys were enumerated directly in the error response, in contrast to vaguer failures seen with less mature tooling.
-- Docker containers with no persistent volumes lose all state on recreation; this was hit repeatedly — including during a full project migration from GitHub Codespaces (after exhausting its free storage quota) to a local machine, and back again once the Codespace quota reset — and worked around each time by re-registering connectors and recreating source data from committed setup scripts.
