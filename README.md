@@ -142,6 +142,7 @@ This is a deliberate architectural choice: validation happens once, upstream, an
 ## Room for Improvement / Next Steps
 
 1. **Secrets handling maturity**: connector/service configs reference values via `.env` (git-ignored); the Snowflake private key required extra care beyond `.env` alone given the key-exposure incident — the next step for full production-readiness would be a proper secrets manager (e.g. HashiCorp Vault, cloud KMS) rather than plain environment variables, and a documented key-rotation runbook.
+2. **Failure alerting/observability**: right now, a failure anywhere in the pipeline (a connector crashing, a dbt test failing, a container stuck restarting) is only visible by manually checking logs or the Airflow UI — there's no notification when something breaks. A real gap: nothing currently tells anyone *when* or *why* a failure happened. Next step would be wiring Airflow's built-in failure callbacks (email/Slack on task failure) and/or a lightweight health-check/alerting layer on the always-on services (Gatekeeper, connectors) that aren't managed by Airflow at all.
 
 ## Key Lessons 
 
