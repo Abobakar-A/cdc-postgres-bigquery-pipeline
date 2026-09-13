@@ -13,7 +13,7 @@ invoices_pipeline:
       type: snowflake
       account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
       user: "{{ env_var('SNOWFLAKE_USER') }}"
-      private_key: "{{ env_var('SNOWFLAKE_PRIVATE_KEY') }}"
+      private_key_path: "/app/secrets/snowflake/rsa_key.p8"
       role: "{{ env_var('SNOWFLAKE_ROLE') }}"
       database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
       warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"

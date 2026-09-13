@@ -23,11 +23,15 @@ default_args = {
     'owner': 'airflow',
     'retries': 1,
     'retry_delay': timedelta(minutes=2),
+    'email_on_failure': True,
+    'email': [os.environ.get('ALERT_EMAIL', '')],
 }
 
 dbt_mount = [
     Mount(source='/workspaces/cdc-postgres-bigquery-pipeline/dbt_project',
-          target='/app/dbt_project', type='bind')
+          target='/app/dbt_project', type='bind'),
+    Mount(source='/workspaces/cdc-postgres-bigquery-pipeline/secrets/snowflake',
+          target='/app/secrets/snowflake', type='bind', read_only=True)
 ]
 
 dbt_docker_args = dict(
